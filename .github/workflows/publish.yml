@@ -1,0 +1,88 @@
+name: Prebuild & Publish
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  prebuild:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            arch: x64
+          - platform: linux/arm64
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build prebuild for ${{ matrix.arch }}
+        run: |
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            --output type=local,dest=./out \
+            -f ./Dockerfile \
+            .
+
+      - name: Upload prebuild artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-linux-${{ matrix.arch }}
+          path: out/prebuilds/
+          retention-days: 1
+
+  publish:
+    needs: prebuild
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Download all prebuild artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: prebuilds/
+          merge-multiple: true
+
+      - name: Verify prebuilds
+        run: |
+          echo "Prebuilds:"
+          find prebuilds -type f
+          test -f prebuilds/linux-x64/node.napi.node || { echo "Missing linux-x64 prebuild"; exit 1; }
+          test -f prebuilds/linux-arm64/node.napi.node || { echo "Missing linux-arm64 prebuild"; exit 1; }
+
+      - name: Install dependencies
+        run: npm install --ignore-scripts
+
+      - name: Publish to NPM
+        run: npm publish --access public
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            prebuilds/linux-x64/node.napi.node
+            prebuilds/linux-arm64/node.napi.node
