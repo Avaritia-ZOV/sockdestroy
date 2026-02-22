@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include "sock_destroy.h"
 
 #ifdef UNSUPPORTED_PLATFORM
@@ -9,7 +10,7 @@
 static napi_value kill_sockets_binding(napi_env env, napi_callback_info info) {
     (void)info;
     napi_throw_error(env, "ERR_UNSUPPORTED_PLATFORM",
-        "ss-kill-netlink: This module only works on Linux (kernel >= 4.5 with CAP_NET_ADMIN)");
+        "sockdestroy: This module only works on Linux (kernel >= 4.5 with CAP_NET_ADMIN)");
     return NULL;
 }
 
@@ -84,8 +85,14 @@ static void kill_complete(napi_env env, napi_status status, void *data) {
             if (props_ok) {
                 napi_resolve_deferred(env, w->deferred, result_obj);
             } else {
-                /* Partial object — reject rather than resolve with incomplete data */
-                napi_reject_deferred(env, w->deferred, undefined);
+                /* Partial object — reject with error rather than resolve with incomplete data */
+                napi_value err_msg, error;
+                if (napi_create_string_utf8(env, "Failed to set result properties", NAPI_AUTO_LENGTH, &err_msg) == napi_ok &&
+                    napi_create_error(env, NULL, err_msg, &error) == napi_ok) {
+                    napi_reject_deferred(env, w->deferred, error);
+                } else {
+                    napi_reject_deferred(env, w->deferred, undefined);
+                }
             }
         } else {
             /* OOM: reject rather than resolve with undefined (resolve would crash callers
@@ -107,6 +114,43 @@ static void kill_complete(napi_env env, napi_status status, void *data) {
     free(w->dst_ip);
     free(w);
 }
+
+/* Extract an IP string property from a NAPI object.
+ * Returns: 0=absent/null, 1=found and allocated in *out_ip, -1=type error, -2=OOM.
+ * On -1 or -2, a NAPI exception is thrown; caller must goto cleanup. */
+static int extract_ip_string(napi_env env, napi_value obj, const char *key, char **out_ip) {
+    bool has_key = false;
+    napi_has_named_property(env, obj, key, &has_key);
+    if (!has_key) return 0;
+
+    napi_value val;
+    napi_get_named_property(env, obj, key, &val);
+    napi_valuetype type = napi_undefined;
+    napi_typeof(env, val, &type);
+
+    if (type == napi_string) {
+        size_t len;
+        napi_get_value_string_utf8(env, val, NULL, 0, &len);
+        *out_ip = (char *)malloc(len + 1);
+        if (!*out_ip) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Failed to allocate memory for %s", key);
+            napi_throw_error(env, NULL, msg);
+            return -2;
+        }
+        napi_get_value_string_utf8(env, val, *out_ip, len + 1, NULL);
+        return 1;
+    }
+    if (type != napi_undefined && type != napi_null) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "%s must be a string", key);
+        napi_throw_type_error(env, NULL, msg);
+        return -1;
+    }
+    return 0;
+}
+
+#define MODE_STR_MAXLEN 8
 
 /* killSockets({ src?: string, dst?: string, mode?: string }) -> Promise<{ killed: number, found: number, destroyErrno: number }> */
 static napi_value kill_sockets_binding(napi_env env, napi_callback_info info) {
@@ -134,50 +178,10 @@ static napi_value kill_sockets_binding(napi_env env, napi_callback_info info) {
     }
 
     /* Extract src */
-    napi_value src_val;
-    bool has_src = false;
-    napi_has_named_property(env, argv[0], "src", &has_src);
-    if (has_src) {
-        napi_get_named_property(env, argv[0], "src", &src_val);
-        napi_valuetype src_type = napi_undefined;
-        napi_typeof(env, src_val, &src_type);
-        if (src_type == napi_string) {
-            size_t src_len;
-            napi_get_value_string_utf8(env, src_val, NULL, 0, &src_len);
-            src_ip = (char *)malloc(src_len + 1);
-            if (!src_ip) {
-                napi_throw_error(env, NULL, "Failed to allocate memory for src");
-                goto cleanup;
-            }
-            napi_get_value_string_utf8(env, src_val, src_ip, src_len + 1, &src_len);
-        } else if (src_type != napi_undefined && src_type != napi_null) {
-            napi_throw_type_error(env, NULL, "src must be a string");
-            goto cleanup;
-        }
-    }
+    if (extract_ip_string(env, argv[0], "src", &src_ip) < 0) goto cleanup;
 
     /* Extract dst */
-    napi_value dst_val;
-    bool has_dst = false;
-    napi_has_named_property(env, argv[0], "dst", &has_dst);
-    if (has_dst) {
-        napi_get_named_property(env, argv[0], "dst", &dst_val);
-        napi_valuetype dst_type = napi_undefined;
-        napi_typeof(env, dst_val, &dst_type);
-        if (dst_type == napi_string) {
-            size_t dst_len;
-            napi_get_value_string_utf8(env, dst_val, NULL, 0, &dst_len);
-            dst_ip = (char *)malloc(dst_len + 1);
-            if (!dst_ip) {
-                napi_throw_error(env, NULL, "Failed to allocate memory for dst");
-                goto cleanup;
-            }
-            napi_get_value_string_utf8(env, dst_val, dst_ip, dst_len + 1, &dst_len);
-        } else if (dst_type != napi_undefined && dst_type != napi_null) {
-            napi_throw_type_error(env, NULL, "dst must be a string");
-            goto cleanup;
-        }
-    }
+    if (extract_ip_string(env, argv[0], "dst", &dst_ip) < 0) goto cleanup;
 
     if (!src_ip && !dst_ip) {
         napi_throw_type_error(env, NULL, "At least one of src or dst must be provided");
@@ -185,7 +189,7 @@ static napi_value kill_sockets_binding(napi_env env, napi_callback_info info) {
     }
 
     /* Extract mode (default: OR) */
-    int mode = 0;  /* KILL_MODE_OR */
+    int mode = KILL_MODE_OR;
     napi_value mode_val;
     bool has_mode = false;
     napi_has_named_property(env, argv[0], "mode", &has_mode);
@@ -194,13 +198,15 @@ static napi_value kill_sockets_binding(napi_env env, napi_callback_info info) {
         napi_valuetype mode_type = napi_undefined;
         napi_typeof(env, mode_val, &mode_type);
         if (mode_type == napi_string) {
-            char mode_str[8];
-            size_t mode_len;
-            napi_get_value_string_utf8(env, mode_val, mode_str, sizeof(mode_str), &mode_len);
-            if (mode_len == 3 && mode_str[0] == 'a' && mode_str[1] == 'n' && mode_str[2] == 'd') {
-                mode = 1;  /* KILL_MODE_AND */
+            char mode_str[MODE_STR_MAXLEN];
+            napi_get_value_string_utf8(env, mode_val, mode_str, sizeof(mode_str), NULL);
+            if (strcmp(mode_str, "and") == 0) {
+                mode = KILL_MODE_AND;
             }
-            /* anything else (including 'or') stays at 0 */
+            /* anything else (including 'or') stays at KILL_MODE_OR */
+        } else if (mode_type != napi_undefined && mode_type != napi_null) {
+            napi_throw_type_error(env, NULL, "mode must be a string (\"or\" or \"and\")");
+            goto cleanup;
         }
     }
 
@@ -273,10 +279,12 @@ static napi_value kill_sockets_binding(napi_env env, napi_callback_info info) {
     work_data = NULL;
     return promise;
 
+/* NOTE: goto cleanup is only reachable before work_data is successfully queued.
+ * Once napi_queue_async_work succeeds, kill_complete owns all resources. */
 cleanup:
     free(src_ip);
     free(dst_ip);
-    free(work_data);
+    free(work_data);  /* NULL-safe: only reached before work_data queued */
     return NULL;
 }
 

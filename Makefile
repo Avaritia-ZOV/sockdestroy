@@ -36,7 +36,3 @@ tag-release:
 	git push origin --follow-tags && \
 	echo "Signed tag $$VERSION created and pushed"
 
-
-
-
-

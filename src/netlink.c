@@ -100,7 +100,7 @@ ssize_t netlink_recv(netlink_sock_t *ns, void *buf, size_t buflen) {
 }
 
 ssize_t netlink_recv_expected(netlink_sock_t *ns, void *buf, size_t buflen, uint32_t expected_seq) {
-    for (int attempts = 0; attempts < 16; attempts++) {
+    for (int attempts = 0; attempts < NETLINK_MAX_RECV_RETRIES; attempts++) {
         ssize_t len = netlink_recv(ns, buf, buflen);
         if (len < 0)
             return len;
@@ -110,7 +110,8 @@ ssize_t netlink_recv_expected(netlink_sock_t *ns, void *buf, size_t buflen, uint
             return len;
         /* Wrong sequence — discard and retry */
     }
-    return -ETIMEDOUT;
+    /* Retry limit exceeded: sequence mismatch — protocol error, not a timeout */
+    return -EPROTO;
 }
 
 #endif /* UNSUPPORTED_PLATFORM */
