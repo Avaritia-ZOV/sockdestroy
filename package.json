@@ -1,6 +1,6 @@
 {
   "name": "sockdestroy",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Native Node.js binding for killing TCP sockets via Linux netlink SOCK_DESTROY (ss -K equivalent)",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -17,6 +17,11 @@
     "prebuilds/",
     "binding.gyp"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kastov/sockdestroy.git"
+  },
+  "homepage": "https://github.com/kastov/sockdestroy#readme",
   "scripts": {
     "install": "node-gyp-build || true",
     "build": "node-gyp rebuild",
