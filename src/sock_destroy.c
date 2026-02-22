@@ -16,6 +16,21 @@
 #define RECV_BUF_SIZE (32 * 1024)
 #define RECV_BUF_MAX  (256 * 1024)
 
+/* Apply NETLINK_RECV_TIMEOUT_SEC as SO_RCVTIMEO on a netlink socket fd.
+ * On error, fills result->error_code / error_msg and returns -1. */
+static int apply_recv_timeout(int fd, const char *sock_name, kill_result_t *result) {
+    struct timeval tv = { .tv_sec = NETLINK_RECV_TIMEOUT_SEC, .tv_usec = 0 };
+    int so_err = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (so_err < 0) {
+        int e = errno;
+        result->error_code = e;
+        snprintf(result->error_msg, sizeof(result->error_msg),
+                 "Failed to set receive timeout on %s: %s", sock_name, strerror(e));
+        return -1;
+    }
+    return 0;
+}
+
 /* Parse IP string, returns address family (AF_INET or AF_INET6), stores binary in dst.
    Returns 0 on failure. */
 static int parse_ip(const char *ip_str, uint32_t *dst, int *prefix_len) {
@@ -70,7 +85,7 @@ static int build_bytecode(
     int addr_len = (family == AF_INET6) ? 16 : 4;
     int hostcond_len = sizeof(struct inet_diag_hostcond) + addr_len;
     int op_len = sizeof(struct inet_diag_bc_op) + NLMSG_ALIGN(hostcond_len);
-    if (op_len > 255) return -1;  /* op->yes is uint8_t */
+    if (op_len > UINT8_MAX) return -1;  /* op->yes is uint8_t */
 
     int has_src = (src_addr != NULL);
     int has_dst = (dst_addr != NULL);
@@ -169,7 +184,7 @@ static int destroy_one_socket(netlink_sock_t *kill_sock, const struct inet_diag_
         return err;
 
     /* Read ACK/error response — match sequence number */
-    char ack_buf[256];
+    char ack_buf[NETLINK_ACK_BUF_SIZE];
     ssize_t len = netlink_recv_expected(kill_sock, ack_buf, sizeof(ack_buf), req.nlh.nlmsg_seq);
     if (len < 0)
         return (int)len;
@@ -192,10 +207,16 @@ static int destroy_one_socket(netlink_sock_t *kill_sock, const struct inet_diag_
 
 /* Perform one dump+destroy pass for a single address family.
  * dump_sock and kill_sock are caller-owned and must already be open.
- * recv_buf and recv_buf_size are caller-owned; on EMSGSIZE realloc the pointer
- * and size are updated so the caller sees the grown buffer for subsequent passes.
+ * recv_buf and recv_buf_size are caller-owned; on EMSGSIZE the pointer
+ * and size are updated (via realloc) so subsequent passes see the grown buffer.
+ * family    - AF_INET or AF_INET6 used as sdiag_family in the dump request.
+ *             Also used as the address family in SOCK_DESTROY requests.
+ * bc_family - AF_INET or AF_INET6 used to build the bytecode filter conditions.
+ *             Normally equal to `family`. Set to AF_INET when family=AF_INET6 to
+ *             match IPv4-mapped sockets (::ffff:x.x.x.x) via the kernel's
+ *             cross-family inet_diag_bc_run() matching logic (iproute2/ss pattern).
  * src_addr and/or dst_addr may be NULL.
- * Returns 0 on success, -1 on error (fills error_code/error_msg). */
+ * Returns 0 on success, -1 on error (fills error_code/error_msg in *out_error_*). */
 static int dump_and_destroy(
     netlink_sock_t *dump_sock, netlink_sock_t *kill_sock,
     uint8_t **recv_buf, size_t *recv_buf_size,
@@ -211,7 +232,7 @@ static int dump_and_destroy(
     *out_first_destroy_errno = 0;
 
     /* Build bytecode filter */
-    uint8_t bc_buf[256];
+    uint8_t bc_buf[INET_DIAG_BC_MAX_LEN];
     memset(bc_buf, 0, sizeof(bc_buf));
     int bc_len = build_bytecode(
         bc_family, mode,
@@ -227,7 +248,7 @@ static int dump_and_destroy(
     }
 
     /* Build dump request: nlmsghdr + inet_diag_req_v2 + NLA(bytecode) */
-    uint8_t req_buf[512];
+    uint8_t req_buf[INET_DIAG_REQ_MAX_LEN];
     memset(req_buf, 0, sizeof(req_buf));
 
     struct nlmsghdr *nlh = (struct nlmsghdr *)req_buf;
@@ -399,8 +420,10 @@ int kill_sockets(const char *src_ip, const char *dst_ip, int mode, kill_result_t
     }
 
     /* Safety net: if kernel never sends NLMSG_DONE, don't block the worker thread forever */
-    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
-    setsockopt(dump_sock.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (apply_recv_timeout(dump_sock.fd, "dump socket", result) < 0) {
+        netlink_close(&dump_sock);
+        return -1;
+    }
 
     err = netlink_open(&kill_sock);
     if (err < 0) {
@@ -408,6 +431,13 @@ int kill_sockets(const char *src_ip, const char *dst_ip, int mode, kill_result_t
         snprintf(result->error_msg, sizeof(result->error_msg),
                  "Failed to open kill netlink socket: %s", strerror(-err));
         netlink_close(&dump_sock);
+        return -1;
+    }
+
+    /* Safety net: if kernel never sends an ACK for SOCK_DESTROY, don't block forever */
+    if (apply_recv_timeout(kill_sock.fd, "kill socket", result) < 0) {
+        netlink_close(&dump_sock);
+        netlink_close(&kill_sock);
         return -1;
     }
 
