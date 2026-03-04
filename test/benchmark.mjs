@@ -25,7 +25,10 @@ const ITERATIONS = 3;
 // ---------------------------------------------------------------------------
 
 async function createConnections(count, host = "127.0.0.1") {
-  const server = net.createServer((sock) => sock.resume());
+  const server = net.createServer((sock) => {
+    sock.on("error", () => {}); // Expected when sockets are killed at kernel level
+    sock.resume();
+  });
   await new Promise((resolve) => server.listen(0, host, resolve));
   const port = server.address().port;
 
@@ -38,7 +41,10 @@ async function createConnections(count, host = "127.0.0.1") {
       promises.push(
         new Promise((resolve, reject) => {
           const sock = new net.Socket();
-          sock.connect(port, host, () => resolve(sock));
+          sock.connect(port, host, () => {
+            sock.on("error", () => {}); // Expected when sockets are killed
+            resolve(sock);
+          });
           sock.once("error", reject);
         }),
       );

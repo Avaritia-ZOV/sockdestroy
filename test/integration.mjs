@@ -23,7 +23,10 @@ let sockDestroySupported = true;
  * Returns { server, clients, port } — caller must clean up.
  */
 async function createConnections(count, host = "127.0.0.1") {
-  const server = net.createServer((sock) => sock.resume());
+  const server = net.createServer((sock) => {
+    sock.on("error", () => {}); // Expected when sockets are killed at kernel level
+    sock.resume();
+  });
 
   await new Promise((resolve) => server.listen(0, host, resolve));
   const port = server.address().port;
@@ -35,6 +38,7 @@ async function createConnections(count, host = "127.0.0.1") {
       sock.connect(port, host, resolve);
       sock.once("error", reject);
     });
+    sock.on("error", () => {}); // Expected when sockets are killed at kernel level
     clients.push(sock);
   }
 
